@@ -11,9 +11,22 @@ from typing import Any, Dict, List, Optional
 
 
 # --------------------------------------------------------------------------- request parsing
+# XO speaks two OpenAI dialects depending on the model configured:
+#   Chat Completions: {"model", "messages": [...]}          -> /v1/chat/completions
+#   Responses API:    {"model", "input": [...], "text":{}}  -> /v1/responses
+# All helpers below accept either shape.
+
+def is_responses_request(body: Dict[str, Any]) -> bool:
+    return "input" in body and "messages" not in body
+
 
 def get_messages(body: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return body.get("messages", []) or []
+    msgs = body.get("messages")
+    if msgs is None:
+        msgs = body.get("input")
+    if isinstance(msgs, str):  # Responses API also allows a bare string input
+        return [{"role": "user", "content": msgs}]
+    return msgs or []
 
 
 def _content_to_text(content: Any) -> str:
@@ -107,6 +120,61 @@ def openai_response(content: str, model: str, prompt_tokens: int = 0,
         "service_tier": "default",
         "system_fingerprint": f"gw_{gateway_layer}",
     }
+
+
+def responses_response(content: str, model: str, prompt_tokens: int = 0,
+                       completion_tokens: int = 0, gateway_layer: str = "rules") -> Dict[str, Any]:
+    """A Responses-API body indistinguishable (schema-wise) from OpenAI's."""
+    return {
+        "id": f"resp_gw{uuid.uuid4().hex[:24]}",
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "error": None,
+        "incomplete_details": None,
+        "model": model,
+        "output": [{
+            "id": f"msg_gw{uuid.uuid4().hex[:24]}",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content, "annotations": []}],
+        }],
+        "usage": {
+            "input_tokens": prompt_tokens,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": completion_tokens,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+        "metadata": {"gateway_layer": gateway_layer},
+    }
+
+
+def fabricate_response(request_body: Dict[str, Any], content: str, model: str,
+                       prompt_tokens: int, completion_tokens: int,
+                       gateway_layer: str) -> Dict[str, Any]:
+    """Build a local response in the SAME dialect the request arrived in."""
+    if is_responses_request(request_body):
+        return responses_response(content, model, prompt_tokens,
+                                  completion_tokens, gateway_layer)
+    return openai_response(content, model, prompt_tokens,
+                           completion_tokens, gateway_layer)
+
+
+def assistant_text(response: Dict[str, Any]) -> str:
+    """Extract assistant text from either dialect's response."""
+    # Chat Completions
+    choices = response.get("choices")
+    if choices:
+        return (choices[0].get("message") or {}).get("content") or ""
+    # Responses API
+    for item in response.get("output") or []:
+        if item.get("type") == "message":
+            for part in item.get("content") or []:
+                if part.get("type") == "output_text":
+                    return part.get("text") or ""
+    return ""
 
 
 def est_tokens(text: str) -> int:

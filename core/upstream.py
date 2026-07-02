@@ -42,12 +42,15 @@ def get_client() -> httpx.AsyncClient:
     return _client
 
 
-def _url_and_headers() -> Tuple[str, Dict[str, str]]:
+def _url_and_headers(responses_api: bool = False) -> Tuple[str, Dict[str, str]]:
+    endpoint = "responses" if responses_api else "chat/completions"
     if settings.UPSTREAM_AUTH_STYLE == "azure":
-        url = f"{settings.UPSTREAM_BASE_URL.rstrip('/')}/chat/completions?api-version={settings.AZURE_API_VERSION}"
+        # NOTE: for the Responses API on Azure, UPSTREAM_BASE_URL should be the
+        # v1 base (https://<res>.openai.azure.com/openai/v1), not a deployment path.
+        url = f"{settings.UPSTREAM_BASE_URL.rstrip('/')}/{endpoint}?api-version={settings.AZURE_API_VERSION}"
         headers = {"api-key": settings.UPSTREAM_API_KEY}
     else:
-        url = f"{settings.UPSTREAM_BASE_URL.rstrip('/')}/chat/completions"
+        url = f"{settings.UPSTREAM_BASE_URL.rstrip('/')}/{endpoint}"
         headers = {"Authorization": f"Bearer {settings.UPSTREAM_API_KEY}"}
     headers["Content-Type"] = "application/json"
     return url, headers
@@ -109,23 +112,27 @@ def clean_body(body: Dict[str, Any]) -> Dict[str, Any]:
 
 async def chat_completion(body: Dict[str, Any], route: str,
                           model_override: str = "") -> Tuple[Dict[str, Any], int]:
-    """Forward to upstream; returns (response_json, latency_ms)."""
+    """Forward to upstream (dialect-aware); returns (response_json, latency_ms)."""
     b = clean_body(body)
     if model_override:
         b["model"] = model_override
-    url, headers = _url_and_headers()
+    responses_api = "input" in b and "messages" not in b
+    url, headers = _url_and_headers(responses_api)
     t0 = time.perf_counter()
     resp = await get_client().post(url, json=b, headers=headers)
     latency_ms = int((time.perf_counter() - t0) * 1000)
     if resp.status_code != 200:
         log(logger, logging.ERROR, "upstream error", route=route,
-            status=resp.status_code, body=resp.text[:500], latency_ms=latency_ms)
+            status=resp.status_code, dialect="responses" if responses_api else "chat",
+            body=resp.text[:500], latency_ms=latency_ms)
         resp.raise_for_status()
     data = resp.json()
     usage = data.get("usage", {})
     log(logger, logging.INFO, "upstream ok", route=route, model=data.get("model"),
+        dialect="responses" if responses_api else "chat",
         latency_ms=latency_ms,
-        prompt_tokens=usage.get("prompt_tokens"),
-        cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
-        completion_tokens=usage.get("completion_tokens"))
+        prompt_tokens=usage.get("prompt_tokens", usage.get("input_tokens")),
+        cached_tokens=((usage.get("prompt_tokens_details")
+                        or usage.get("input_tokens_details") or {}).get("cached_tokens")),
+        completion_tokens=usage.get("completion_tokens", usage.get("output_tokens")))
     return data, latency_ms

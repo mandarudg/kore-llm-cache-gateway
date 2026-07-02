@@ -25,7 +25,8 @@ from core import cache as cache_mod
 from core import driver_match, rules, traffic_bank, upstream
 from core.config import settings
 from core.logging_setup import log, setup_logging
-from core.schemas import est_tokens, last_user_text, openai_response, system_text
+from core.schemas import (assistant_text, est_tokens, fabricate_response,
+                          last_user_text, system_text)
 
 setup_logging()
 logger = logging.getLogger("gateway")
@@ -63,9 +64,7 @@ def _bank(route: str, rid: str, layer: str, body: Dict[str, Any],
         "user_input": last_user_text(body)[:1000],
         "model": response.get("model"),
         "usage": response.get("usage"),
-        "assistant_content": (
-            (response.get("choices") or [{}])[0].get("message", {}).get("content", "")
-        )[:6000],
+        "assistant_content": assistant_text(response)[:6000],
         "request_body": body,
         "response_body": response,
         **extra,
@@ -86,10 +85,10 @@ async def _serve_orchestrator(body: Dict[str, Any], rid: str) -> Tuple[Dict[str,
 
     if verdict and not settings.SHADOW_MODE:
         content, rule_name = verdict
-        resp = openai_response(content, model="gateway-rules",
-                               prompt_tokens=est_tokens(sys_txt),
-                               completion_tokens=est_tokens(content),
-                               gateway_layer="rules")
+        resp = fabricate_response(body, content, model="gateway-rules",
+                                  prompt_tokens=est_tokens(sys_txt),
+                                  completion_tokens=est_tokens(content),
+                                  gateway_layer="rules")
         return resp, "rules", {"rule": rule_name}
 
     # LLM path (optionally restructured for prefix caching)
@@ -101,7 +100,7 @@ async def _serve_orchestrator(body: Dict[str, Any], rid: str) -> Tuple[Dict[str,
                                              settings.ORCH_MODEL_OVERRIDE)
     extra: Dict[str, Any] = {"prefix_restructured": restructured}
     if verdict:  # shadow mode: compare rule verdict vs LLM ground truth
-        llm_content = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        llm_content = assistant_text(resp)
         agree = _verdicts_agree(verdict[0], llm_content)
         extra.update({"shadow_rule": verdict[1], "shadow_rule_verdict": verdict[0],
                       "shadow_agree": agree})
@@ -131,17 +130,17 @@ async def _serve_agent_node(body: Dict[str, Any], rid: str) -> Tuple[Dict[str, A
 
     if match and not settings.SHADOW_MODE:
         content, note = match
-        resp = openai_response(content, model="gateway-code",
-                               prompt_tokens=est_tokens(sys_txt),
-                               completion_tokens=est_tokens(content),
-                               gateway_layer="code_match")
+        resp = fabricate_response(body, content, model="gateway-code",
+                                  prompt_tokens=est_tokens(sys_txt),
+                                  completion_tokens=est_tokens(content),
+                                  gateway_layer="code_match")
         return resp, "code_match", {"match_note": note}
 
     resp, _ = await upstream.chat_completion(body, "agent-node",
                                              settings.AGENT_MODEL_OVERRIDE)
     extra: Dict[str, Any] = {}
     if match:
-        llm_content = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        llm_content = assistant_text(resp)
         # agreement = same downloadLink chosen
         agree = _same_download_link(match[0], llm_content)
         extra.update({"shadow_match_note": match[1], "shadow_agree": agree})
@@ -168,8 +167,12 @@ async def _serve_search(body: Dict[str, Any], rid: str) -> Tuple[Dict[str, Any],
     if key:
         cached = cache_mod.get_backend().get(key)
         if cached and not settings.SHADOW_MODE:
-            cached["id"] = f"chatcmpl-gw-{uuid.uuid4().hex[:24]}"  # fresh id per serve
-            cached["system_fingerprint"] = "gw_cache"
+            prefix = "resp_gw" if cached.get("object") == "response" else "chatcmpl-gw-"
+            cached["id"] = f"{prefix}{uuid.uuid4().hex[:24]}"  # fresh id per serve
+            if cached.get("object") == "response":
+                cached.setdefault("metadata", {})["gateway_layer"] = "cache"
+            else:
+                cached["system_fingerprint"] = "gw_cache"
             return cached, "cache", {"cache_key": key[:16]}
 
     resp, _ = await upstream.chat_completion(body, "search",

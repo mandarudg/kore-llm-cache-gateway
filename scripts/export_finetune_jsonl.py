@@ -66,7 +66,9 @@ def main():
                         continue  # only LLM-labeled examples are ground truth
                     req = rec.get("request_body") or {}
                     assistant = rec.get("assistant_content") or ""
-                    msgs = req.get("messages") or []
+                    msgs = req.get("messages") or req.get("input") or []
+                    if isinstance(msgs, str):
+                        msgs = [{"role": "user", "content": msgs}]
                     if not msgs or not assistant:
                         skipped += 1
                         continue
